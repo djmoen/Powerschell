@@ -1,0 +1,239 @@
+function Check-AdminRights {
+    $currentUser = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    $isAdmin = $currentUser.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    
+    if (-not $isAdmin) {
+        $scriptPath = $MyInvocation.MyCommand.Path
+        $arguments = $MyInvocation.InvocationName + " " + $MyInvocation.BoundParameters.GetEnumerator() | ForEach-Object { $_.Value }
+        $processStartInfo = New-Object System.Diagnostics.ProcessStartInfo -Property @{
+            FileName = $scriptPath
+            Arguments = $arguments
+            Verb = "runas"
+        }
+        
+        try {
+            [System.Diagnostics.Process]::Start($processStartInfo) | Out-Null
+            exit
+        }
+        catch {
+            Write-Host "Failed to start the script with administrator rights. Exiting..."
+            exit
+        }
+    }
+}
+
+# Call the function to check for administrator rights
+Check-AdminRights
+
+Import-Module ActiveDirectory
+$domainControllerIP = Read-Host -Prompt "Enter the domain controller IP address"
+$domain = Read-Host -Prompt "Enter the domain name"
+
+# Set default output path and filename if none is provided
+$outputPath = Read-Host -Prompt "Enter the output file path and name (Press Enter for default: C:\Output.html)"
+if ([string]::IsNullOrWhiteSpace($outputPath)) {
+    $outputPath = "C:\Output.html"
+}
+
+echo "--------------------------------"
+echo "check so everything is good to go"
+echo "--------------------------------"
+echo "IP of domain controller: $domainControllerIP "
+echo "Domain of domain controller: $domain "
+echo "Path of file: $outputPath "
+Write-Host "Cancel if provided info is not given for Domain controller IP and Domain name" -ForegroundColor Red
+echo "--------------------------------"
+$confirm = Read-Host -Prompt "Do you want to run the script? cancel (N) Run (Y)"
+if ($confirm -ne "Y") {
+    Write-Host "Script execution canceled."
+    return
+}
+
+try {
+    $pingResult = Test-Connection -ComputerName $domainControllerIP -Count 1 -ErrorAction Stop
+    Write-Host "Ping to domain controller '$domainControllerIP' successful."
+
+    $adResult = Get-ADDomainController -DomainName $domain -Discover -ErrorAction Stop
+    $domainController = $adResult | Where-Object { $_.IPv4Address -eq $domainControllerIP }
+
+    if ($domainController) {
+        Write-Host "Connected to Active Directory domain controller:"
+        $domainController | Format-List Name, IPv4Address, Site
+
+        Write-Host "Discovering client computers in Active Directory:"
+        $clientComputers = Get-ADComputer -Filter {OperatingSystem -like "*Windows*"} -Property Name,OperatingSystem,IPv4Address -Server $domainController.Name
+
+        if ($clientComputers) {
+            Write-Host "Client computers in Active Directory:"
+            $clientComputers | Format-Table Name, OperatingSystem, IPv4Address -AutoSize
+
+            Write-Host "Retrieving running processes on client computers:"
+
+            $output = @()
+            foreach ($client in $clientComputers) {
+                $clientName = $client.Name
+                $clientIP = $client.IPv4Address
+
+                Write-Host "Running processes on client computer: $clientName [$clientIP]"
+                try {
+                    $processes = Invoke-Command -ComputerName $clientName -ScriptBlock { Get-Process } -ErrorAction Stop
+                    if ($processes) {
+                        $processesTable = $processes | Select-Object -Property Name, Id, CPU, WorkingSet | ConvertTo-Html -Fragment
+                        $output += @"
+<h2>$clientName [$clientIP]</h2>
+<table>
+    <tr>
+        <th>Name</th>
+        <th>ID</th>
+        <th>CPU</th>
+        <th>Working Set</th>
+    </tr>
+    $processesTable
+</table>
+"@
+                    } else {
+                        $output += "<p>No processes found on client computer: $clientName [$clientIP]</p>"
+                    }
+                } catch {
+                    $errorMessage = "<p class='error'>Failed to retrieve processes on client computer: $clientName [$clientIP]. Error: $($_.Exception.Message)</p>"
+                    $output += $errorMessage
+                }
+            }
+
+            $htmlContent = @"
+<html>
+<head>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+        h1 {
+            text-align: center;
+        }
+        h2 {
+            margin-top: 20px;
+        }
+        table {
+            border-collapse: collapse;
+            width: 100%;
+        }
+        th, td {
+            border: 1px solid #ddd;
+            padding: 8px;
+        }
+        th {
+            background-color: #f2f2f2;
+        }
+        .error {
+            color: red;
+        }
+        .footer {
+            margin-top: 20px;
+            text-align: center;
+            color: gray;
+        }
+    </style>
+    <script>
+        function searchTable() {
+            var input = document.getElementById('searchInput');
+            var filter = input.value.toUpperCase();
+            var table = document.getElementById('processTable');
+            var rows = table.getElementsByTagName('tr');
+
+            for (var i = 0; i < rows.length; i++) {
+                var cells = rows[i].getElementsByTagName('td');
+                var found = false;
+                for (var j = 0; j < cells.length; j++) {
+                    var cell = cells[j];
+                    if (cell) {
+                        if (cell.innerHTML.toUpperCase().indexOf(filter) > -1) {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if (found) {
+                    rows[i].style.display = '';
+                } else {
+                    rows[i].style.display = 'none';
+                }
+            }
+        }
+    </script>
+</head>
+<body>
+    <h1>Client Computer Processes</h1>
+    <input type='text' id='searchInput' onkeyup='searchTable()' placeholder='Search for process name...'>
+    $output
+    <div class='footer'>
+        <p>Generated by PowerShell - made by ChatGPT and Ken-Roy Impens</p>
+    </div>
+</body>
+</html>
+"@
+
+            $htmlContent | Out-File -FilePath $outputPath -Encoding UTF8
+            Write-Host "Output exported to: $outputPath"
+        } else {
+            Write-Host "No client computers found in Active Directory."
+        }
+
+        Write-Host "Connection test to Active Directory successful."
+    } else {
+        Write-Host "Failed to find Active Directory domain controller with IP address: $domainControllerIP"
+    }
+} catch {
+    Write-Host "Failed to connect to Active Directory domain controller:"
+    $errorMessage = "<p class='error'>$($_.Exception.Message)</p>"
+    $htmlErrorContent = @"
+<html>
+<head>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+        .error {
+            color: red;
+        }
+        .footer {
+            margin-top: 20px;
+            text-align: center;
+            color: gray;
+        }
+    </style>
+</head>
+<body>
+    $errorMessage
+    <div class='footer'>
+        <p>Generated by PowerShell - made by ChatGPT and Ken-Roy Impens</p>
+    </div>
+</body>
+</html>
+"@
+    $htmlErrorContent | Out-File -FilePath $outputPath -Encoding UTF8
+    Write-Host "Error output exported to: $outputPath"
+}
+Write-Host "----------------------------------------------------------"
+Write-Host "            Path for file $outputPath                     "
+Write-Host "----------------------------------------------------------"
+Write-Host "__________________________________________________________"
+Write-Host "Script execution complete. Thank you for using our script!"
+Write-Host "        Script made by ChatGTP & Ken-Roy Impens"
+Write-Host "__________________________________________________________"
+Write-Host ""
+Write-Host @"
+      .-""""""-.
+    .'          '.
+   /   ^      ^   \
+  :               :
+  |  \       /    |   
+  :    .___,      :
+   \             ,
+    '.          .'
+      '-..- -"""
+"@
+Write-Host ""
+Write-Host "HELP MY IM STUCK IN THIS MACHINE!!"
+Read-Host "Press Enter to exit the console and free that sad little man"
